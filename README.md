@@ -9,10 +9,10 @@ git clone github.com/hojamuhammet/tiny-torrent.git
 ```
 
 ## Usage
-Try by downloading Debian!
+Try by downloading Arch Linux!
 
 ```sh
-torrent-client debian-10.2.0-amd64-netinst.iso.torrent debian.iso
+tiny-torrent ./torrentfile/test_torrent/archlinux-2019.12.01-x86_64.iso.torrent archlinux.iso
 ```
 
 
