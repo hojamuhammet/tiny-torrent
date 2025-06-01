@@ -18,6 +18,8 @@ const (
 	MsgRequest       messageID = 6
 	MsgPiece         messageID = 7
 	MsgCancel        messageID = 8
+	MsgPort          messageID = 9
+	MsgExtended      messageID = 20
 )
 
 type Message struct {
@@ -30,7 +32,9 @@ func FormatRequest(index, begin, length int) *Message {
 	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
 	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
 	binary.BigEndian.PutUint32(payload[8:12], uint32(length))
-	return &Message{ID: MsgRequest, Payload: payload}
+	msg := &Message{ID: MsgRequest, Payload: payload}
+	fmt.Printf("[Serialize] Created Request message - Index: %d, Begin: %d, Length: %d\n", index, begin, length)
+	return msg
 }
 
 func FormatHave(index int) *Message {
@@ -75,38 +79,51 @@ func ParseHave(msg *Message) (int, error) {
 
 func (m *Message) Serialize() []byte {
 	if m == nil {
+		fmt.Println("[Serialize] KeepAlive message")
 		return make([]byte, 4)
 	}
-	length := uint32(len(m.Payload) + 1) // +1 for id
+	length := uint32(len(m.Payload) + 1)
 	buf := make([]byte, 4+length)
 	binary.BigEndian.PutUint32(buf[0:4], length)
 	buf[4] = byte(m.ID)
 	copy(buf[5:], m.Payload)
+	fmt.Printf("[Serialize] Serializing message - ID: %s (%d), Payload Length: %d, Payload: %x\n", m.name(), m.ID, len(m.Payload), m.Payload)
 	return buf
 }
 
 func Read(r io.Reader) (*Message, error) {
 	lengthBuf := make([]byte, 4)
+	fmt.Println("[Read] Waiting to read message length...")
 	_, err := io.ReadFull(r, lengthBuf)
 	if err != nil {
+		fmt.Printf("[Read] Error reading length: %v\n", err)
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(lengthBuf)
+	fmt.Printf("[Read] Message length: %d\n", length)
 
-	// keep-alive message
 	if length == 0 {
+		fmt.Println("[Read] KeepAlive message received")
 		return nil, nil
 	}
 
 	messageBuf := make([]byte, length)
+	fmt.Printf("[Read] Reading message payload of %d bytes...\n", length)
 	_, err = io.ReadFull(r, messageBuf)
 	if err != nil {
+		fmt.Printf("[Read] Error reading payload: %v\n", err)
 		return nil, err
 	}
 
 	m := Message{
 		ID:      messageID(messageBuf[0]),
 		Payload: messageBuf[1:],
+	}
+
+	fmt.Printf("[Read] Received message: ID=%s (%d), Payload Length: %d, Payload=%x\n", m.name(), m.ID, len(m.Payload), m.Payload)
+
+	if m.ID == MsgUnchoke {
+		fmt.Println("[Protocol] Received Unchoke - Ready to request pieces")
 	}
 
 	return &m, nil
@@ -135,6 +152,10 @@ func (m *Message) name() string {
 		return "Piece"
 	case MsgCancel:
 		return "Cancel"
+	case MsgPort:
+		return "Port"
+	case MsgExtended:
+		return "Extended"
 	default:
 		return fmt.Sprintf("Unknown#%d", m.ID)
 	}

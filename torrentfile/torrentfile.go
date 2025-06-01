@@ -55,11 +55,14 @@ func (t *TorrentFile) DownloadToFile(path string) error {
 		Length:      t.Length,
 		Name:        t.Name,
 	}
+
+	fmt.Println("[Download] Starting piece download...")
 	buf, err := torrent.Download()
 	if err != nil {
-		return err
+		return fmt.Errorf("torrent download failed: %w", err)
 	}
 
+	fmt.Println("[Download] Finished downloading, writing to file...")
 	outFile, err := os.Create(path)
 	if err != nil {
 		return err
@@ -87,16 +90,6 @@ func Open(path string) (TorrentFile, error) {
 	return bto.toTorrentFile()
 }
 
-func (i *bencodeInfo) hash() ([20]byte, error) {
-	var buf bytes.Buffer
-	err := bencode.Marshal(&buf, *i)
-	if err != nil {
-		return [20]byte{}, err
-	}
-	h := sha1.Sum(buf.Bytes())
-	return h, nil
-}
-
 func (i *bencodeInfo) splitPieceHashes() ([][20]byte, error) {
 	hashLen := 20 // Length of SHA-1 hash
 	buf := []byte(i.Pieces)
@@ -114,21 +107,24 @@ func (i *bencodeInfo) splitPieceHashes() ([][20]byte, error) {
 }
 
 func (bto *bencodeTorrent) toTorrentFile() (TorrentFile, error) {
-	infoHash, err := bto.Info.hash()
+	var infoBuf bytes.Buffer
+	err := bencode.Marshal(&infoBuf, bto.Info)
 	if err != nil {
 		return TorrentFile{}, err
 	}
+	infoHash := sha1.Sum(infoBuf.Bytes())
+
 	pieceHashes, err := bto.Info.splitPieceHashes()
 	if err != nil {
 		return TorrentFile{}, err
 	}
-	t := TorrentFile{
+
+	return TorrentFile{
 		Announce:    bto.Announce,
 		InfoHash:    infoHash,
 		PieceHashes: pieceHashes,
 		PieceLength: bto.Info.PieceLength,
 		Length:      bto.Info.Length,
 		Name:        bto.Info.Name,
-	}
-	return t, nil
+	}, nil
 }

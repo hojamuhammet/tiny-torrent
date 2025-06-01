@@ -24,7 +24,11 @@ func (h *Handshake) Serialize() []byte {
 	buf[0] = byte(len(h.Pstr))
 	curr := 1
 	curr += copy(buf[curr:], h.Pstr)
-	curr += copy(buf[curr:], make([]byte, 8)) // 8 reserved bytes
+
+	var reserved [8]byte
+	reserved[5] |= 0x10 // BEP-10 extension-protocol flag
+	curr += copy(buf[curr:], reserved[:])
+
 	curr += copy(buf[curr:], h.InfoHash[:])
 	curr += copy(buf[curr:], h.PeerID[:])
 	return buf

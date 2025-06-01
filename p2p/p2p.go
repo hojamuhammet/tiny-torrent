@@ -5,16 +5,17 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"log"
+	"net"
 	"runtime"
 	"time"
 
 	"github.com/hojamuhammet/tiny-torrent/client"
 	"github.com/hojamuhammet/tiny-torrent/message"
 	"github.com/hojamuhammet/tiny-torrent/peers"
+	"github.com/jackpal/bencode-go"
 )
 
 const MaxBlockSize = 16384
-
 const MaxBacklog = 5
 
 type Torrent struct {
@@ -50,24 +51,30 @@ type pieceProgress struct {
 func (state *pieceProgress) readMessage() error {
 	msg, err := state.client.Read()
 	if err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			return nil
+		}
 		return err
 	}
-
-	if msg == nil { // keep-alive
+	if msg == nil {
+		log.Printf("Keep-alive or no message received")
 		return nil
 	}
 
 	switch msg.ID {
 	case message.MsgUnchoke:
 		state.client.Choked = false
+		log.Printf("Received UNCHOKE")
 	case message.MsgChoke:
 		state.client.Choked = true
+		log.Printf("Received CHOKE")
 	case message.MsgHave:
 		index, err := message.ParseHave(msg)
 		if err != nil {
 			return err
 		}
 		state.client.Bitfield.SetPiece(index)
+		log.Printf("Received HAVE for piece %d", index)
 	case message.MsgPiece:
 		n, err := message.ParsePiece(state.index, state.buf, msg)
 		if err != nil {
@@ -75,6 +82,14 @@ func (state *pieceProgress) readMessage() error {
 		}
 		state.downloaded += n
 		state.backlog--
+		log.Printf("Received PIECE data, downloaded %d bytes", n)
+	case 20:
+		log.Printf("Received EXTENDED message")
+		if len(msg.Payload) > 0 && msg.Payload[0] == 0 {
+			handleExtendedHandshake(msg.Payload[1:])
+		}
+	default:
+		log.Printf("Received unknown message ID: %d", msg.ID)
 	}
 	return nil
 }
@@ -86,8 +101,7 @@ func attemptDownloadPiece(c *client.Client, pw *pieceWork) ([]byte, error) {
 		buf:    make([]byte, pw.length),
 	}
 
-	c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
-	defer c.Conn.SetDeadline(time.Time{}) // Disable the deadline
+	c.Conn.SetDeadline(time.Time{})
 
 	for state.downloaded < pw.length {
 		if !state.client.Choked {
@@ -96,18 +110,14 @@ func attemptDownloadPiece(c *client.Client, pw *pieceWork) ([]byte, error) {
 				if pw.length-state.requested < blockSize {
 					blockSize = pw.length - state.requested
 				}
-
-				err := c.SendRequest(pw.index, state.requested, blockSize)
-				if err != nil {
+				if err := c.SendRequest(pw.index, state.requested, blockSize); err != nil {
 					return nil, err
 				}
 				state.backlog++
 				state.requested += blockSize
 			}
 		}
-
-		err := state.readMessage()
-		if err != nil {
+		if err := state.readMessage(); err != nil {
 			return nil, err
 		}
 	}
@@ -123,41 +133,57 @@ func checkIntegrity(pw *pieceWork, buf []byte) error {
 	return nil
 }
 
-func (t *Torrent) startDownloadWorker(peer peers.Peer, workQueue chan *pieceWork, results chan *pieceResult) {
-	c, err := client.New(peer, t.PeerID, t.InfoHash)
+func (t *Torrent) startDownloadWorker(peer peers.Peer,
+	work chan *pieceWork, out chan *pieceResult) {
+
+	c, err := client.New(peer, t.PeerID, t.InfoHash, len(t.PieceHashes))
 	if err != nil {
-		log.Printf("Could not handshake with %s. Disconnecting\n", peer.IP)
+		log.Printf("handshake %s: %v", peer, err)
 		return
 	}
 	defer c.Conn.Close()
-	log.Printf("Completed handshake with %s\n", peer.IP)
 
-	c.SendUnchoke()
-	c.SendInterested()
+	gotBF := false
+	c.Bitfield = make([]byte, (len(t.PieceHashes)+7)/8)
 
-	for pw := range workQueue {
-		if !c.Bitfield.HasPiece(pw.index) {
-			workQueue <- pw
-			continue
-		}
-
-		// Download the piece
-		buf, err := attemptDownloadPiece(c, pw)
+	for {
+		msg, err := c.Read()
 		if err != nil {
-			log.Println("Exiting", err)
-			workQueue <- pw
 			return
 		}
-
-		err = checkIntegrity(pw, buf)
-		if err != nil {
-			log.Printf("Piece #%d failed integrity check\n", pw.index)
-			workQueue <- pw
+		if msg == nil {
 			continue
 		}
-
-		c.SendHave(pw.index)
-		results <- &pieceResult{pw.index, buf}
+		switch msg.ID {
+		case message.MsgUnchoke:
+			c.Choked = false
+			goto READY
+		case message.MsgBitfield:
+			c.Bitfield, gotBF = msg.Payload, true
+		case message.MsgHave:
+			if i, e := message.ParseHave(msg); e == nil {
+				c.Bitfield.SetPiece(i)
+				gotBF = true
+			}
+		}
+	}
+READY:
+	for pw := range work {
+		if gotBF && !c.Bitfield.HasPiece(pw.index) {
+			work <- pw
+			continue
+		}
+		buf, err := attemptDownloadPiece(c, pw)
+		if err != nil {
+			work <- pw
+			return
+		}
+		if checkIntegrity(pw, buf) != nil {
+			work <- pw
+			continue
+		}
+		_ = c.SendHave(pw.index)
+		out <- &pieceResult{pw.index, buf}
 	}
 }
 
@@ -203,4 +229,20 @@ func (t *Torrent) Download() ([]byte, error) {
 	close(workQueue)
 
 	return buf, nil
+}
+
+func handleExtendedHandshake(payload []byte) {
+	type extendedHandshake struct {
+		M            map[string]int `bencode:"m"`
+		MetadataSize int            `bencode:"metadata_size"`
+	}
+
+	var hs extendedHandshake
+	err := bencode.Unmarshal(bytes.NewReader(payload), &hs)
+	if err != nil {
+		log.Printf("Failed to parse extended handshake: %v", err)
+		return
+	}
+
+	log.Printf("Extended handshake: %+v", hs)
 }
